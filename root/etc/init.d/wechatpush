@@ -14,9 +14,33 @@ start_service() {
 }
 
 reload_service() {
+    enable_value=$(uci get wechatpush.config.enable 2>/dev/null || echo "0")
+    [ "$enable_value" -ne 0 ] && skip_firewall_cleanup=1
     stop
+    unset skip_firewall_cleanup
     sleep 1
     start
+}
+
+
+clear_forward_blacklist_rules() {
+    if command -v fw4 >/dev/null 2>&1; then
+        for set_name in wechatpush_blacklist wechatpush_blacklistv6; do
+            nft --handle list chain inet fw4 forward 2>/dev/null | awk -v set_name="@$set_name" 'index($0, set_name " ") && / drop comment "!wechatpush Forward Drop rule"/ {print $NF}' | while read -r handle; do
+                nft delete rule inet fw4 forward handle "$handle" >/dev/null 2>&1
+            done
+        done
+    else
+        for family in ip ip6; do
+            case "$family" in
+                ip) set_name=wechatpush_blacklist ;;
+                ip6) set_name=wechatpush_blacklistv6 ;;
+            esac
+            while ${family}tables -C FORWARD -m set --match-set "$set_name" src -j DROP >/dev/null 2>&1; do
+                ${family}tables -D FORWARD -m set --match-set "$set_name" src -j DROP >/dev/null 2>&1 || break
+            done
+        done
+    fi
 }
 
 stop_service() {
@@ -28,8 +52,25 @@ stop_service() {
             kill $child_pid
         done
     }
-    local pids=$(ps | grep "wechatpush" | grep -v grep | grep -v $$ | awk '{print $1}')
+	local helpers=$(ps | grep -E '/usr/libexec/wechatpush-call|\{wechatpush\}_[0-9]+' | grep -v grep | grep -v $$ | awk '{print $1}')
+	[ -n "$helpers" ] && echo "$helpers" | xargs kill 2>/dev/null
+    local pids=$(ps | grep '/usr/share/wechatpush/wechatpush' | grep -v grep | grep -v $$ | awk '{print $1}')
 	[ -n "$pids" ] && echo "$pids" | xargs kill 2>/dev/null
+    for pid in $pids; do
+        attempts=0
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$attempts" -ge 5 ]; then
+                kill -KILL "$pid" 2>/dev/null
+                break
+            fi
+            sleep 1
+            attempts=$((attempts + 1))
+        done
+    done
+    for pid in $helpers; do
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    done
+	[ "$skip_firewall_cleanup" = "1" ] || clear_forward_blacklist_rules
     echo "Terminating wechatpush process..."
 }
 
