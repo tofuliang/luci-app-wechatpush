@@ -574,7 +574,12 @@ return view.extend({
 		o.rmempty = false;
 		o.datatype = 'and(uinteger,min(0))';
 		o.depends('login_web_black', '1');
-		o.description = _('\"0\" in ipset means permanent blacklist, use with caution. If misconfigured, change the device IP and clear rules in LUCI.<br/>Note: The whitelist for bans is located under the \"Do Not Disturb\" tab.');
+		o.description = _('"0" means permanent blacklist, use with caution. If misconfigured, change the device IP and clear rules in LUCI.<br/>Note: The whitelist for bans is located under the "Do Not Disturb" tab.');
+
+		o = s.taboption('ipset', form.Flag, 'block_blacklisted_forwarding', _('Block forwarded traffic from blacklisted IPs'));
+		o.default = '0';
+		o.depends('login_web_black', '1');
+		o.description = _('Includes port-forwarded access to downstream devices and LAN clients accessing the Internet.');
 
 		o = s.taboption('ipset', form.Flag, 'port_knocking_enable', _('Port knocking'));
 		o.default = '0';
@@ -776,7 +781,7 @@ return view.extend({
 		o.depends({ login_notification: "ssh_logged", '!contains': true });
 		o.depends({ login_notification: "web_login_failed", '!contains': true });
 		o.depends({ login_notification: "ssh_login_failed", '!contains': true });
-		o.description = _('Add the IP addresses in the list to the whitelist for the blocking function (if available), and ignore automatic blocking and login event notifications. Only record in the log. Mask notation is currently not supported.');
+		o.description = _('Configured IPs have highest priority over auto-ban input and forwarding blocks, and ignore automatic blocking and login event notifications. Independent login grants only authorize the configured TCP login ports and port forwards, without bypassing forwarding bans. Mask notation is currently not supported.');
 
 		o = s.taboption('disturb', form.Flag, 'login_log_enable', _('Login reminder log anti-flooding'));
 		o.description = _('Users in the whitelist or during the undisturbed time period after their first login IP will be exempt from log recording, preventing log flooding.');
