@@ -19,6 +19,196 @@ reload_service() {
     start
 }
 
+# 清除持久化封禁规则（包含文件由 wechatpush 生成，路径需与其保持一致）
+clear_blacklist_rules() {
+    local rc=0
+    if ! command -v fw4 >/dev/null 2>&1; then
+        rm -f /etc/nftables.d/20-wechatpush-blacklist.nft || { echo "Failed to remove wechatpush blacklist include" >&2; rc=1; }
+        local tables blacklist_set whitelist_set chain rules owned port destination target metadata references nat_chains
+        for tables in iptables ip6tables; do
+            blacklist_set="wechatpush_blacklist"
+            [ "$tables" = "ip6tables" ] && blacklist_set="wechatpush_blacklistv6"
+            for chain in INPUT FORWARD; do
+                while "$tables" -C "$chain" -m set --match-set "$blacklist_set" src -j DROP >/dev/null 2>&1; do
+                    "$tables" -D "$chain" -m set --match-set "$blacklist_set" src -j DROP >/dev/null 2>&1 || { echo "Failed to remove $tables $chain blacklist rule" >&2; rc=1; break; }
+                done
+                # 旧混合集合名只用于历史 DROP 迁移清理识别，不再作为成功登录授权来源。
+                for whitelist_set in wechatpush_whitelist wechatpush_config_whitelist; do
+                    [ "$tables" = "ip6tables" ] && whitelist_set="${whitelist_set}v6"
+                    while "$tables" -C "$chain" -m set --match-set "$blacklist_set" src -m set ! --match-set "$whitelist_set" src -j DROP >/dev/null 2>&1; do
+                        "$tables" -D "$chain" -m set --match-set "$blacklist_set" src -m set ! --match-set "$whitelist_set" src -j DROP >/dev/null 2>&1 || { echo "Failed to remove $tables $chain whitelist-excluded blacklist rule" >&2; rc=1; break; }
+                    done
+                done
+            done
+            # 先撤销配置来源的完整 INPUT/NAT 规则，再删除集合；成功登录规则和元素保持不变。
+            whitelist_set="wechatpush_config_whitelist"
+            [ "$tables" = "ip6tables" ] && whitelist_set="wechatpush_config_whitelistv6"
+            if ! metadata=$(ipset list "$whitelist_set" 2>&1); then
+                case "$metadata" in
+                    *"does not exist"*) continue ;;
+                    *) echo "Failed to inspect $whitelist_set: $metadata" >&2; rc=1 ;;
+                esac
+            fi
+            rules=$("$tables" -S INPUT 2>/dev/null) || { echo "Failed to enumerate $tables INPUT rules" >&2; rc=1; rules=""; }
+            owned=$(printf '%s\n' "$rules" | awk -v set_name="$whitelist_set" '
+                BEGIN {
+                    first="-A INPUT -p tcp -m set --match-set " set_name " src -m multiport --dports "
+                    second="-A INPUT -m set --match-set " set_name " src -p tcp -m multiport --dports "
+                }
+                {
+                    if (index($0, first) == 1) ports=substr($0, length(first)+1)
+                    else if (index($0, second) == 1) ports=substr($0, length(second)+1)
+                    else next
+                    if (ports !~ / -j ACCEPT$/) next
+                    sub(/ -j ACCEPT$/, "", ports)
+                    if (ports ~ /^[0-9]+(:[0-9]+)?(,[0-9]+(:[0-9]+)?)*$/) print ports
+                }
+            ') || { echo "Failed to identify $tables configured INPUT rules" >&2; rc=1; owned=""; }
+            printf '%s\n' "$owned" | while IFS= read -r port; do
+                [ -n "$port" ] || continue
+                "$tables" -D INPUT -m set --match-set "$whitelist_set" src -p tcp -m multiport --dports "$port" -j ACCEPT >/dev/null 2>&1 || { echo "Failed to remove $tables configured INPUT rule" >&2; exit 1; }
+            done || rc=1
+            # 只剩配置集合本身时直接销毁，不要求 filter-only 系统安装可选 NAT 模块。
+            metadata=$(ipset list "$whitelist_set" 2>&1) || { echo "Failed to inspect remaining references for $whitelist_set: $metadata" >&2; rc=1; metadata=""; }
+            references=$(printf '%s\n' "$metadata" | awk '$1 == "References:" && $2 ~ /^[0-9]+$/ {print $2; exit}') || references=""
+            [ -n "$references" ] || { echo "Failed to read remaining references for $whitelist_set" >&2; rc=1; }
+            nat_chains=""
+            [ "$references" = "0" ] || nat_chains="PREROUTING POSTROUTING"
+            for chain in $nat_chains; do
+                rules=$("$tables" -t nat -S "$chain" 2>/dev/null) || { echo "Failed to enumerate $tables NAT $chain rules" >&2; rc=1; continue; }
+                owned=$(printf '%s\n' "$rules" | awk -v set_name="$whitelist_set" -v chain="$chain" -v family="$tables" '
+                    $1 == "-A" && $2 == chain {
+                        protocol=source=direction=port=destination=jump=target=target_option=""
+                        set_module=tcp_module=invalid=0
+                        for (i=3; i<=NF; i++) {
+                            option=$i
+                            if (option == "-p" && protocol == "" && i<NF) protocol=$(++i)
+                            else if (option == "-m" && i<NF) {
+                                module=$(++i)
+                                if (module == "set" && !set_module) set_module=1
+                                else if (module == "tcp" && !tcp_module) tcp_module=1
+                                else {invalid=1; break}
+                            }
+                            else if (option == "--match-set" && source == "" && i+2<=NF) {source=$(++i); direction=$(++i)}
+                            else if (option == "--dport" && port == "" && i<NF) port=$(++i)
+                            else if (option == "-d" && destination == "" && i<NF) destination=$(++i)
+                            else if (option == "-j" && jump == "" && i<NF) jump=$(++i)
+                            else if ((option == "--to-destination" || option == "--to-source") && target == "" && i<NF) {target_option=option; target=$(++i)}
+                            else {invalid=1; break}
+                        }
+                        if (invalid || protocol != "tcp" || !set_module || source != set_name || direction != "src" || port !~ /^[0-9]+$/) next
+                        if (chain == "PREROUTING" && jump == "DNAT" && target_option == "--to-destination" && destination == "") {
+                            if (family == "ip6tables" && target !~ /^\[[[:xdigit:]:]+\]:[0-9]+$/) next
+                            if (family == "iptables" && target !~ /^[0-9.]+:[0-9]+$/) next
+                            print "-", port, target
+                        } else if (chain == "POSTROUTING" && jump == "SNAT" && target_option == "--to-source") {
+                            if (family == "ip6tables" && (destination !~ /^[[:xdigit:]:]+(\/128)?$/ || target !~ /^[[:xdigit:]:]+$/)) next
+                            if (family == "iptables" && (destination !~ /^[0-9.]+(\/32)?$/ || target !~ /^[0-9.]+$/)) next
+                            print destination, port, target
+                        }
+                    }
+                ') || { echo "Failed to identify $tables configured NAT $chain rules" >&2; rc=1; owned=""; }
+                printf '%s\n' "$owned" | while read -r destination port target; do
+                    [ -n "$port" ] || continue
+                    if [ "$chain" = "PREROUTING" ]; then
+                        "$tables" -t nat -D "$chain" -m set --match-set "$whitelist_set" src -p tcp --dport "$port" -j DNAT --to-destination "$target" >/dev/null 2>&1 || { echo "Failed to remove $tables configured DNAT rule" >&2; exit 1; }
+                    else
+                        "$tables" -t nat -D "$chain" -m set --match-set "$whitelist_set" src -p tcp -d "$destination" --dport "$port" -j SNAT --to-source "$target" >/dev/null 2>&1 || { echo "Failed to remove $tables configured SNAT rule" >&2; exit 1; }
+                    fi
+                done || rc=1
+            done
+            if ! ipset destroy "$whitelist_set" >/dev/null 2>&1; then
+                echo "Failed to destroy $whitelist_set; revoking its configured authorization" >&2
+                rc=1
+                ipset flush "$whitelist_set" >/dev/null 2>&1 || echo "Failed to revoke configured authorization in $whitelist_set" >&2
+            fi
+        done
+        for whitelist_set in wechatpush_cfg_white_tmp wechatpush_cfg_white_tmpv6; do
+            ipset list "$whitelist_set" >/dev/null 2>&1 || continue
+            ipset destroy "$whitelist_set" >/dev/null 2>&1 || { echo "Failed to destroy $whitelist_set" >&2; rc=1; }
+        done
+        return "$rc"
+    fi
+    {
+        flock -x 1000 || { echo "Failed to lock fw4 for wechatpush cleanup" >&2; return 1; }
+        rm -f /etc/nftables.d/20-wechatpush-blacklist.nft || { echo "Failed to remove wechatpush blacklist include" >&2; rc=1; }
+        local set_name tag rules handle handles metadata commands="" chain ip_version family
+        for chain in wechatpush_pre_input wechatpush_pre_inputv6 wechatpush_pre_forward wechatpush_pre_forwardv6; do
+            if ! metadata=$(nft list chain inet fw4 "$chain" 2>&1); then
+                case "$metadata" in
+                    *"No such file or directory"*|*"does not exist"*) continue ;;
+                    *) echo "Failed to inspect blacklist chain $chain: $metadata" >&2; rc=1; continue ;;
+                esac
+            fi
+            nft flush chain inet fw4 "$chain" >/dev/null 2>&1 || { echo "Failed to flush blacklist chain $chain" >&2; rc=1; }
+            nft delete chain inet fw4 "$chain" >/dev/null 2>&1 || { echo "Failed to delete blacklist chain $chain" >&2; rc=1; }
+        done
+        for set_name in wechatpush_config_whitelist wechatpush_config_whitelistv6; do
+            if ! metadata=$(nft list set inet fw4 "$set_name" 2>&1); then
+                case "$metadata" in
+                    *"No such file or directory"*|*"does not exist"*) continue ;;
+                    *) echo "Failed to inspect $set_name: $metadata" >&2; rc=1 ;;
+                esac
+            fi
+            ip_version="ip" family="ipv4"
+            case "$set_name" in *v6) ip_version="ip6"; family="ipv6" ;; esac
+            commands=""
+            for chain in input wechatpush_dstnat; do
+                tag="!wechatpush Accept rule"
+                [ "$chain" = "wechatpush_dstnat" ] && tag="!wechatpush DNAT rule"
+                if ! rules=$(nft --numeric --handle list chain inet fw4 "$chain" 2>&1); then
+                    case "$rules" in
+                        *"No such file or directory"*|*"does not exist"*) continue ;;
+                        *) echo "Failed to inspect $chain for $set_name: $rules" >&2; rc=1; continue ;;
+                    esac
+                fi
+                # 与运行时相同的完整 producer 匹配；注释相同但动作/谓词不同的规则保持外部归属。
+                handles=$(printf '%s\n' "$rules" | awk -v source="$ip_version saddr @$set_name " -v tag="comment \"$tag\"" -v ip_version="$ip_version" -v proto="meta nfproto $family " '
+                    BEGIN {
+                        port="[0-9]+(-[0-9]+)?"
+                        ports="(" port "|\\{ " port "(, " port ")* \\})"
+                        numeric_proto="meta nfproto " (ip_version == "ip6" ? 10 : 2) " "
+                        auth=""
+                        if (tag == "comment \"!wechatpush Accept rule\"") {
+                            auth="^tcp dport " ports " " source "counter accept " tag "$"
+                        } else if (tag == "comment \"!wechatpush DNAT rule\"") {
+                            if (ip_version == "ip6") {
+                                address="[0-9A-Fa-f:.]+"
+                                target="(\\[" address "\\](-\\[" address "\\])?|\\[" address "-" address "\\]):" port
+                            } else {
+                                address="[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"
+                                target=address "(-" address ")?:" port
+                            }
+                            auth="^" source "tcp dport " ports " counter dnat " ip_version " to " target " " tag "$"
+                        }
+                    }
+                    {
+                        line=$0
+                        sub(/^[[:space:]]+/, "", line)
+                        sub(/[[:space:]]+# handle [0-9]+[[:space:]]*$/, "", line)
+                        gsub(/counter packets [0-9]+ bytes [0-9]+/, "counter", line)
+                        if (index(line, proto) == 1) line=substr(line, length(proto)+1)
+                        else if (index(line, numeric_proto) == 1) line=substr(line, length(numeric_proto)+1)
+                        if (auth != "" && line ~ auth) print $NF
+                    }
+                ') || { echo "Failed to identify $chain rules for $set_name" >&2; rc=1; handles=""; }
+                for handle in $handles; do
+                    commands="${commands}delete rule inet fw4 $chain handle $handle
+"
+                done
+            done
+            commands="${commands}delete set inet fw4 $set_name
+"
+            if ! printf '%s' "$commands" | nft -f - >/dev/null 2>&1; then
+                echo "Failed to clean up $set_name; revoking its configured authorization" >&2
+                rc=1
+                nft flush set inet fw4 "$set_name" >/dev/null 2>&1 || echo "Failed to revoke configured authorization in $set_name" >&2
+            fi
+        done
+        return "$rc"
+    } 1000>/var/run/fw4.lock
+}
+
 stop_service() {
     [ -f ${dir}child_pid ] && parent_pid=$(cat ${dir}child_pid)
     [ -n "$parent_pid" ] && {
@@ -28,9 +218,35 @@ stop_service() {
             kill $child_pid
         done
     }
-    local pids=$(ps | grep "wechatpush" | grep -v grep | grep -v $$ | awk '{print $1}')
-	[ -n "$pids" ] && echo "$pids" | xargs kill 2>/dev/null
+    local helpers
+    helpers=$(pgrep -f '(^|[[:space:]])/usr/libexec/wechatpush-call([[:space:]]|$)|\{wechatpush\}_[0-9]+')
+    [ -n "$helpers" ] && kill $helpers 2>/dev/null
+    local pids
+    pids=$(pgrep -f '^/bin/bash /usr/share/wechatpush/wechatpush([[:space:]]|$)')
+    [ -n "$pids" ] && kill $pids 2>/dev/null
+    local pid attempts
+    for pid in $pids; do
+        attempts=0
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$attempts" -ge 5 ]; then
+                kill -KILL "$pid" 2>/dev/null
+                break
+            fi
+            sleep 1
+            attempts=$((attempts + 1))
+        done
+    done
+    for pid in $helpers; do
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    done
+    # 卸载时默认 prerm 先 disable 再 stop；升级不会 disable，仍保留正在生效的封禁。
+    local cleanup_rc=0
+    enable_value=$(uci get wechatpush.config.enable 2>/dev/null || echo "0")
+    if [ "${enable_value:-0}" -ne "1" ] || ! /etc/init.d/wechatpush enabled; then
+        clear_blacklist_rules || { echo "Failed to completely clear wechatpush firewall rules" >&2; cleanup_rc=1; }
+    fi
     echo "Terminating wechatpush process..."
+    return "$cleanup_rc"
 }
 
 service_triggers() {

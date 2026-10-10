@@ -868,8 +868,8 @@ msgid "Users in the whitelist or during the undisturbed time period after their 
 msgstr "白名单列表内的用户，或者登录 IP 处于首次登录后的免打扰时段，不做日志记录，避免日志刷屏"
 
 #: applications/luci-app-wechatpush/htdocs/luci-static/resources/view/wechatpush/config.js:688
-msgid "Add the IP addresses in the list to the whitelist for the blocking function (if available), and ignore automatic blocking and login event notifications. Only record in the log. Mask notation is currently not supported."
-msgstr "列表内 IP 加入封禁功能白名单(如果可用)，并忽略自动封禁和登录事件推送，仅在日志中记录，暂不支持掩码位表示"
+msgid "Configured IPs have highest priority over auto-ban input and forwarding blocks, and ignore automatic blocking and login event notifications. Independent login grants only authorize the configured TCP login ports and port forwards, without bypassing forwarding bans. Mask notation is currently not supported."
+msgstr "配置的白名单 IP 优先于自动封禁的输入与转发限制，并忽略自动封禁和登录事件推送；独立登录授权仅用于配置的 TCP 登录端口和端口映射，不豁免黑名单转发封禁。暂不支持掩码位表示。"
 
 #: applications/luci-app-wechatpush/htdocs/luci-static/resources/view/wechatpush/advanced.js:17
 msgid "If you are not familiar with the meanings of these options, please do not modify them.<br/><br/>"
@@ -1636,6 +1636,12 @@ msgstr "重新拨号咯"
 
 msgid "Failed to add to blacklist, invalid IP format: %s (removed from list)"
 msgstr "黑名单添加失败，IP %s 格式错误，已从列表中移除"
+
+msgid "Failed to create blacklist chain: %s"
+msgstr "创建黑名单规则链失败：%s"
+
+msgid "Failed to add blacklist rule to %s"
+msgstr "向规则链 %s 添加黑名单规则失败"
 
 msgid "Currently %s devices online"  
 msgstr "当前共 %s 台设备在线"

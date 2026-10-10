@@ -781,7 +781,7 @@ return view.extend({
 		o.depends({ login_notification: "ssh_logged", '!contains': true });
 		o.depends({ login_notification: "web_login_failed", '!contains': true });
 		o.depends({ login_notification: "ssh_login_failed", '!contains': true });
-		o.description = _('Add the IP addresses in the list to the whitelist for the blocking function (if available), and ignore automatic blocking and login event notifications. Only record in the log. Mask notation is currently not supported.');
+		o.description = _('Configured IPs have highest priority over auto-ban input and forwarding blocks, and ignore automatic blocking and login event notifications. Independent login grants only authorize the configured TCP login ports and port forwards, without bypassing forwarding bans. Mask notation is currently not supported.');
 
 		o = s.taboption('disturb', form.Flag, 'login_log_enable', _('Login reminder log anti-flooding'));
 		o.description = _('Users in the whitelist or during the undisturbed time period after their first login IP will be exempt from log recording, preventing log flooding.');
